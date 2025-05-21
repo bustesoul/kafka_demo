@@ -452,6 +452,10 @@ async fn kafka_consumer_kafka(
         } else {
             println!("[Kafka Consumer] 收到无payload消息");
         }
+        if activity_over.load(Ordering::Relaxed) && *stock.lock().await == 0 {
+            println!("[Kafka Consumer] 活动已结束且库存为0，消费者主动退出。");
+            break;
+        }
     }
     println!("[Kafka Consumer] 消费者退出，消息流关闭，已处理{}条消息", msg_count);
 }
@@ -515,7 +519,7 @@ async fn run_kafka_backend(config: &SeckillConfig) {
             user_id,
             request_initiation_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
         };
-        if user_id % 100 == 0 {
+        if user_id % 300 == 0 {
             println!("[Kafka] 已生产{}条请求", user_id);
         }
         kafka_produce_kafka(&producer, topic, &req).await;
@@ -534,6 +538,13 @@ async fn run_kafka_backend(config: &SeckillConfig) {
         all_results.push(r);
     }
     println!("[Kafka] Kafka流程完成，总处理请求数：{}", all_results.len());
+
+    // 等待所有 Kafka consumer 任务退出，防止 runtime 挂起
+    // Stop the consumer
+    for handle in consumer_handles {
+        let _ = handle.await;
+    }
+    println!("[Kafka] 所有Kafka消费者任务已退出");
 }
 
 fn run_seckill_simulation(config: SeckillConfig) {
