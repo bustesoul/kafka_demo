@@ -13,7 +13,6 @@ use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
-use crate::QueueBackend::Simulate;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct SeckillRequest {
@@ -184,7 +183,7 @@ fn enqueue_requests(
     }
     println!("{} 个早鸟用户请求已发送至队列。", early_bird_count);
 
-    let pause_duration = Duration::from_secs(5);
+    let pause_duration = Duration::from_secs((early_bird_count / 70) as u64);
     println!("模拟活动进行中，{} 秒后后续用户开始进入...", pause_duration.as_secs());
     thread::sleep(pause_duration);
 
@@ -374,7 +373,7 @@ async fn kafka_produce_kafka(
     // .key(Some(&req.user_id.to_string()))
     let send_res = producer.send(record, Duration::from_secs(5)).await;
     match send_res {
-        Ok(delivery) => {
+        Ok(_delivery) => {
             // 这里可以只打印部分用户，比如每100条
             if req.user_id % 500 == 0 {
                 println!("[Kafka Produce] 成功发送User{}消息到Kafka", req.user_id);
@@ -547,39 +546,52 @@ async fn run_kafka_backend(config: &SeckillConfig) {
     println!("[Kafka] 所有Kafka消费者任务已退出");
 }
 
-fn run_seckill_simulation(config: SeckillConfig) {
-    match &config.queue_backend {
+// run_seckill_simulation is now async
+async fn run_seckill_simulation(config: SeckillConfig) {
+    match config.queue_backend { // config is moved here, so no need to borrow
         QueueBackend::Simulate => {
-            run_simulate_backend(&config);
+            println!("[MAIN] 选择内存模拟后端，准备运行模拟流程...");
+            run_simulate_backend(&config); // Pass config by reference if it's not consumed
         }
-        QueueBackend::Kafka { .. } => {
-            run_kafka_backend(&config);
+        QueueBackend::Kafka { .. } => { // We don't need to destructure brokers and topic here
+            println!("[MAIN] 选择Kafka后端，准备连接Kafka并运行流程...");
+            run_kafka_backend(&config).await; // Add .await here, pass by reference
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let config = SeckillConfig {
-        user_count: 2000,
-        initial_stock: 20,
-        consumer_speeds: vec![30, 35, 40, 45, 50],
-        timeout_ms: 110,
-        queue_backend: QueueBackend::Kafka {
-            brokers: "172.20.19.27:9092".to_string(),
-            topic: "seckill_test".to_string(),
-        },
+    // To test Simulate mode and remove the "variant Simulate is never constructed" warning:
+    let use_simulate_mode = true; // << CHANGE THIS TO true/false TO SWITCH MODES
+
+    let config = if use_simulate_mode {
+        println!("[MAIN] 配置为: 模拟模式");
+        SeckillConfig {
+            user_count: 2000, // Smaller count for faster simulation testing
+            initial_stock: 10,
+            consumer_speeds: vec![30, 50, 80], // Fewer consumers for simulation
+            timeout_ms: 110,
+            queue_backend: QueueBackend::Simulate, // This uses the Simulate variant
+        }
+    } else {
+        println!("[MAIN] 配置为: Kafka模式");
+        SeckillConfig {
+            user_count: 2000,
+            initial_stock: 20,
+            consumer_speeds: vec![30, 35, 40, 45, 50], // This implies 5 Kafka consumers
+            timeout_ms: 110, //ms
+            queue_backend: QueueBackend::Kafka {
+                brokers: "172.20.19.27:9092".to_string(),
+                topic: "seckill_test".to_string(),
+            },
+        }
     };
-    println!("[MAIN] 启动秒杀系统，配置: {:?}", config);
-    match &config.queue_backend {
-        QueueBackend::Simulate => {
-            println!("[MAIN] 选择内存模拟后端，准备运行模拟流程...");
-            run_simulate_backend(&config)
-        }
-        QueueBackend::Kafka { .. } => {
-            println!("[MAIN] 选择Kafka后端，准备连接Kafka并运行流程...");
-            run_kafka_backend(&config).await
-        }
-    }
+
+    println!("[MAIN] 启动秒杀系统，完整配置: {:?}", config);
+
+    // Call the unified simulation function
+    run_seckill_simulation(config.clone()).await; // Clone config if it's used later, or pass ownership
+
     println!("[MAIN] 秒杀系统流程主入口退出。");
 }
