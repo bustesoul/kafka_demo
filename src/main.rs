@@ -1,27 +1,51 @@
+use futures::StreamExt;
+use rand::{rng, seq::SliceRandom, Rng};
+use rdkafka::consumer::Consumer;
+use rdkafka::consumer::StreamConsumer;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::ClientConfig;
+use rdkafka::Message;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
-use rand::{Rng, seq::SliceRandom, rng};
+use std::time::SystemTime;
+use std::time::{Duration, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as TokioMutex;
+use crate::QueueBackend::Simulate;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SeckillRequest {
     user_id: usize,
-    request_initiation_time: Instant,
+    request_initiation_time: u128, // 用u128存timestamp，Kafka不能用Instant
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum SeckillResult {
     Success { user_id: usize, cost_ms: u128 },
     Fail { user_id: usize, cost_ms: u128, reason: String },
     PendingTimeout { user_id: usize, cost_ms: u128 },
 }
 
+#[derive(Debug, Clone)]
+enum QueueBackend {
+    Simulate, // 内存队列
+    Kafka {
+        // 这里可扩展Kafka相关配置，如brokers、topic等
+        brokers: String,
+        topic: String,
+        // 可根据实际需求添加认证、分区等配置项
+    },
+}
+
+#[derive(Clone, Debug)]
 struct SeckillConfig {
     user_count: usize,
     initial_stock: usize,
     consumer_speeds: Vec<u64>,
     timeout_ms: u128,
+    queue_backend: QueueBackend,
 }
 
 fn kafka_consumer(
@@ -44,7 +68,8 @@ fn kafka_consumer(
             // 检查活动是否已全局标记为结束
             if activity_officially_over.load(Ordering::Relaxed) {
                 // 活动已结束，快速处理路径
-                let cost_ms = req.request_initiation_time.elapsed().as_millis();
+                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                let cost_ms = now_ms.saturating_sub(req.request_initiation_time);
                 if cost_ms > timeout_ms {
                     results.lock().unwrap().push(SeckillResult::PendingTimeout {
                         user_id: req.user_id,
@@ -60,7 +85,8 @@ fn kafka_consumer(
             } else {
                 // 活动尚未标记为结束（或当前线程未知），进行正常处理模拟
                 thread::sleep(Duration::from_millis(rng.random_range(5..=speed_factor)));
-                let cost_ms = req.request_initiation_time.elapsed().as_millis();
+                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                let cost_ms = now_ms.saturating_sub(req.request_initiation_time);
 
                 // 1. 首先检查是否处理超时 (这是高并发下最先可能发生的情况)
                 if cost_ms > timeout_ms {
@@ -120,7 +146,7 @@ fn kafka_consumer(
     }
 }
 
-fn kafka_produce(queue: &Arc<Mutex<VecDeque<SeckillRequest>>>, user_id: usize, request_initiation_time: Instant) {
+fn kafka_produce(queue: &Arc<Mutex<VecDeque<SeckillRequest>>>, user_id: usize, request_initiation_time: u128) {
     let mut q = queue.lock().unwrap();
     q.push_back(SeckillRequest { user_id, request_initiation_time });
 }
@@ -147,7 +173,7 @@ fn enqueue_requests(
             let mut rng_producer = rng();
             let delay_ms = rng_producer.random_range(0..=5);
             thread::sleep(Duration::from_millis(delay_ms));
-            let request_initiation_time = Instant::now();
+            let request_initiation_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             kafka_produce(&queue_clone, user_id, request_initiation_time);
         });
         handles.push(handle);
@@ -173,7 +199,7 @@ fn enqueue_requests(
                 let mut rng_producer = rng();
                 let delay_ms = rng_producer.random_range(10..=100);
                 thread::sleep(Duration::from_millis(delay_ms));
-                let request_initiation_time = Instant::now();
+                let request_initiation_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
                 kafka_produce(&queue_clone, user_id, request_initiation_time);
             });
             handles.push(handle);
@@ -224,7 +250,7 @@ fn start_consumers(
     handles
 }
 
-fn print_and_stat_results_with_timeout(results_arc: &Arc<Mutex<Vec<SeckillResult>>>, timeout_val_param: u128) {
+fn print_and_stat_results_with_timeout(results_arc: &Arc<Mutex<Vec<SeckillResult>>>, _timeout_val_param: u128) {
     let mut stats = (0, 0, 0); // success, fail, timeout
     let mut success_users = Vec::new();
     let mut all_results = results_arc.lock().unwrap().clone();
@@ -274,7 +300,7 @@ fn print_and_stat_results_with_timeout(results_arc: &Arc<Mutex<Vec<SeckillResult
     // }
 }
 
-fn run_seckill_simulation(config: SeckillConfig) {
+fn run_simulate_backend(config: &SeckillConfig) {
     let stock = Arc::new(Mutex::new(config.initial_stock));
     let queue = Arc::new(Mutex::new(VecDeque::new()));
     let results = Arc::new(Mutex::new(Vec::new()));
@@ -337,13 +363,212 @@ fn run_seckill_simulation(config: SeckillConfig) {
     println!("模拟结束。");
 }
 
-fn main() {
+
+async fn kafka_produce_kafka(
+    producer: &FutureProducer,
+    topic: &str,
+    req: &SeckillRequest,
+) {
+    let payload = serde_json::to_vec(req).unwrap();
+    let record: FutureRecord<'_, (), [u8]> = FutureRecord::to(topic).payload(&payload);
+    // .key(Some(&req.user_id.to_string()))
+    let send_res = producer.send(record, Duration::from_secs(5)).await;
+    match send_res {
+        Ok(delivery) => {
+            // 这里可以只打印部分用户，比如每100条
+            if req.user_id % 500 == 0 {
+                println!("[Kafka Produce] 成功发送User{}消息到Kafka", req.user_id);
+            }
+        }
+        Err(e) => {
+            println!("[Kafka Produce] 发送消息失败: User{} 错误: {:?}", req.user_id, e);
+        }
+    }
+}
+
+async fn kafka_consumer_kafka(
+    consumer: std::sync::Arc<StreamConsumer>,
+    config: SeckillConfig,
+    result_sender: tokio::sync::mpsc::UnboundedSender<SeckillResult>,
+    stock: Arc<tokio::sync::Mutex<usize>>,
+    activity_over: Arc<AtomicBool>,
+) {
+    let mut message_stream = consumer.stream();
+    let mut msg_count = 0usize;
+    println!("[Kafka Consumer] 消费者启动, 等待消息...");
+
+    while let Some(Ok(msg)) = message_stream.next().await {
+        msg_count += 1;
+        if msg_count % 100 == 0 {
+            println!("[Kafka Consumer] 已处理{}条消息", msg_count);
+        }
+        if let Some(payload) = msg.payload() {
+            if let Ok(req) = serde_json::from_slice::<SeckillRequest>(payload) {
+                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                let cost_ms = now_ms.saturating_sub(req.request_initiation_time);
+                // 下面保持原逻辑，可补充细致日志
+                if activity_over.load(Ordering::Relaxed) {
+                    if cost_ms > config.timeout_ms {
+                        let _ = result_sender.send(SeckillResult::PendingTimeout {
+                            user_id: req.user_id,
+                            cost_ms,
+                        });
+                        println!("[Kafka Consumer] 用户{} 消费超时", req.user_id);
+                    } else {
+                        let _ = result_sender.send(SeckillResult::Fail {
+                            user_id: req.user_id,
+                            cost_ms,
+                            reason: "活动已结束 (Kafka快速拒绝)".to_string(),
+                        });
+                        // println!("[Kafka Consumer] 用户{} 活动已结束(快速拒绝)", req.user_id);
+                    }
+                } else {
+                    let mut stock_guard = stock.lock().await;
+                    if *stock_guard > 0 {
+                        *stock_guard -= 1;
+                        if *stock_guard == 0 {
+                            activity_over.store(true, Ordering::SeqCst);
+                            println!("[Kafka Consumer] 用户{} 抢到最后一件库存！活动标记结束", req.user_id);
+                        }
+                        drop(stock_guard);
+                        let _ = result_sender.send(SeckillResult::Success {
+                            user_id: req.user_id,
+                            cost_ms,
+                        });
+                        println!("[Kafka Consumer] 用户{} 抢购成功", req.user_id);
+                    } else {
+                        activity_over.store(true, Ordering::SeqCst);
+                        let _ = result_sender.send(SeckillResult::Fail {
+                            user_id: req.user_id,
+                            cost_ms,
+                            reason: "已无库存 (Kafka分布式锁后)".to_string(),
+                        });
+                        println!("[Kafka Consumer] 用户{} 已无库存", req.user_id);
+                    }
+                }
+            } else {
+                println!("[Kafka Consumer] 反序列化消息失败");
+            }
+        } else {
+            println!("[Kafka Consumer] 收到无payload消息");
+        }
+    }
+    println!("[Kafka Consumer] 消费者退出，消息流关闭，已处理{}条消息", msg_count);
+}
+
+async fn run_kafka_backend(config: &SeckillConfig) {
+    let (brokers, topic) = match &config.queue_backend {
+        QueueBackend::Kafka { brokers, topic, .. } => (brokers.as_str(), topic.as_str()),
+        _ => unreachable!(),
+    };
+    println!("[Kafka] 开始创建Producer, brokers={}, topic={}", brokers, topic);
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("Producer creation error");
+    println!("[Kafka] Producer创建成功");
+
+    println!("[Kafka] 开始创建Consumer");
+    let group_id = "seckill_consumer_group";
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", group_id)
+        .set("bootstrap.servers", brokers)
+        .set("enable.partition.eof", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .expect("Consumer creation error");
+    consumer.subscribe(&[topic]).unwrap();
+    let consumer = Arc::new(consumer);
+    println!("[Kafka] Consumer创建并订阅成功，启动消费者任务");
+
+    // 并发环境下的库存和结束标记
+    let stock = Arc::new(TokioMutex::new(config.initial_stock));
+    let activity_over = Arc::new(AtomicBool::new(false));
+
+    // 用mpsc传递结果
+    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+
+    // 启动消费者任务
+    let mut consumer_handles = vec![];
+    for i in 0..config.consumer_speeds.len() {
+        println!("[Kafka] 启动第{}个消费者任务", i + 1);
+        let consumer_clone = Arc::clone(&consumer);
+        let stock_clone = stock.clone();
+        let activity_over_clone = activity_over.clone();
+        let sender_clone = result_sender.clone();
+        let config_clone = config.clone();
+        consumer_handles.push(tokio::spawn(kafka_consumer_kafka(
+            consumer_clone,
+            config_clone,
+            sender_clone,
+            stock_clone,
+            activity_over_clone,
+        )));
+    }
+
+    println!("[Kafka] 所有消费者任务已启动, 开始批量生产消息...");
+    // 生产者批量发消息
+    for user_id in 1..=config.user_count {
+        let req = SeckillRequest {
+            user_id,
+            request_initiation_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+        };
+        if user_id % 100 == 0 {
+            println!("[Kafka] 已生产{}条请求", user_id);
+        }
+        kafka_produce_kafka(&producer, topic, &req).await;
+    }
+    println!("[Kafka] 生产者所有消息已发送, 关闭result_sender");
+
+    drop(result_sender); // 通知消费者：不会再有结果发进来了
+
+    println!("[Kafka] 开始接收消费者处理结果...");
+    // 收集结果
+    let mut all_results = Vec::new();
+    while let Some(r) = result_receiver.recv().await {
+        if all_results.len() % 100 == 0 {
+            println!("[Kafka] 已接收到{}条消费结果", all_results.len());
+        }
+        all_results.push(r);
+    }
+    println!("[Kafka] Kafka流程完成，总处理请求数：{}", all_results.len());
+}
+
+fn run_seckill_simulation(config: SeckillConfig) {
+    match &config.queue_backend {
+        QueueBackend::Simulate => {
+            run_simulate_backend(&config);
+        }
+        QueueBackend::Kafka { .. } => {
+            run_kafka_backend(&config);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
     let config = SeckillConfig {
         user_count: 2000,
         initial_stock: 20,
-        consumer_speeds: vec![30, 35, 40, 45, 50], // 5个消费者
-        timeout_ms: 110, // 原为160ms，可调整
+        consumer_speeds: vec![30, 35, 40, 45, 50],
+        timeout_ms: 110,
+        queue_backend: QueueBackend::Kafka {
+            brokers: "172.20.19.27:9092".to_string(),
+            topic: "seckill_test".to_string(),
+        },
     };
-
-    run_seckill_simulation(config);
+    println!("[MAIN] 启动秒杀系统，配置: {:?}", config);
+    match &config.queue_backend {
+        QueueBackend::Simulate => {
+            println!("[MAIN] 选择内存模拟后端，准备运行模拟流程...");
+            run_simulate_backend(&config)
+        }
+        QueueBackend::Kafka { .. } => {
+            println!("[MAIN] 选择Kafka后端，准备连接Kafka并运行流程...");
+            run_kafka_backend(&config).await
+        }
+    }
+    println!("[MAIN] 秒杀系统流程主入口退出。");
 }

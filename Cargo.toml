@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.45", features = ["full"] }
+rdkafka = {version = "0.37", features = ["tokio"] }
+futures = "0.3.31"
