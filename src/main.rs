@@ -14,6 +14,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 
+// =================== 数据结构定义 ===================
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct SeckillRequest {
     user_id: usize,
@@ -45,6 +46,156 @@ struct SeckillConfig {
     consumer_speeds: Vec<u64>, // 每个消费者模拟处理的最大耗时 (ms)
     timeout_ms: u128,
     queue_backend: QueueBackend,
+}
+
+// =================== 主入口与调度逻辑 ===================
+#[tokio::main]
+async fn main() {
+    // To test Simulate mode and remove the "variant Simulate is never constructed" warning:
+    let use_simulate_mode = false; // << CHANGE THIS TO true/false TO SWITCH MODES
+
+    let config = if use_simulate_mode {
+        println!("[MAIN] 配置为: 模拟模式");
+        SeckillConfig {
+            user_count: 2000, // Smaller count for faster simulation testing
+            initial_stock: 10,
+            consumer_speeds: vec![30, 50, 80], // Fewer consumers for simulation
+            timeout_ms: 110,
+            queue_backend: QueueBackend::Simulate, // This uses the Simulate variant
+        }
+    } else {
+        println!("[MAIN] 配置为: Kafka模式");
+        SeckillConfig {
+            user_count: 2000,
+            initial_stock: 20,
+            consumer_speeds: vec![30, 35, 40, 45, 50], // This implies 5 Kafka consumers
+            timeout_ms: 110, //ms
+            queue_backend: QueueBackend::Kafka {
+                brokers: "172.20.19.27:9092".to_string(),
+                topic: "seckill_test".to_string(),
+            },
+        }
+    };
+
+    println!("[MAIN] 启动秒杀系统，完整配置: {:?}", config);
+
+    // Call the unified simulation function
+    run_seckill_simulation(config.clone()).await; // Clone config if it's used later, or pass ownership
+
+    println!("[MAIN] 秒杀系统流程主入口退出。");
+}
+
+// run_seckill_simulation is now async
+async fn run_seckill_simulation(config: SeckillConfig) {
+    match config.queue_backend {
+        QueueBackend::Simulate => {
+            println!("[MAIN] 选择内存模拟后端，准备运行模拟流程...");
+            simulate_backend_flow(&config);
+        }
+        QueueBackend::Kafka { .. } => {
+            println!("[MAIN] 选择Kafka后端，准备连接Kafka并运行流程...");
+            kafka_backend_flow(&config).await;
+        }
+    }
+}
+
+// =================== Simulate 模式相关函数 ===================
+fn simulate_backend_flow(config: &SeckillConfig) {
+    let stock = Arc::new(Mutex::new(config.initial_stock));
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let producing_active = Arc::new(AtomicBool::new(true)); // 生产者是否还在生成请求
+    let activity_officially_over = Arc::new(AtomicBool::new(false)); // 活动是否已正式结束 (库存为0)
+
+    println!(
+        "模拟开始：{} 用户，{} 库存，{} 消费者 (各速度上限 {:?}ms)，超时 {}ms. 活动结束条件：库存为0.",
+        config.user_count, config.initial_stock, config.consumer_speeds.len(), config.consumer_speeds, config.timeout_ms
+    );
+
+    // 启动消费者线程
+    let consumer_handles = spawn_consumer_threads(
+        Arc::clone(&queue),
+        Arc::clone(&stock),
+        Arc::clone(&results),
+        &config.consumer_speeds,
+        config.timeout_ms,
+        Arc::clone(&producing_active),
+        Arc::clone(&activity_officially_over),
+    );
+
+    // 启动生产者线程 (模拟用户请求入队)
+    let producer_handle = thread::spawn({
+        let queue_clone = Arc::clone(&queue);
+        let producing_active_clone = Arc::clone(&producing_active);
+        let user_count = config.user_count;
+        move || {
+            enqueue_requests(user_count, &queue_clone, producing_active_clone);
+        }
+    });
+
+    // 等待生产者完成所有请求的入队
+    producer_handle.join().unwrap();
+    println!("所有生产者任务完成 (请求已入队)。等待消费者处理剩余队列...");
+
+    // 等待所有消费者线程处理完毕并退出
+    for handle in consumer_handles {
+        handle.join().unwrap();
+    }
+    println!("所有消费者已退出。");
+
+    // 打印并统计最终结果
+    print_and_summarize_results(&results);
+
+    // 获取最终剩余库存值，用于对照初始值和结果正确性校验
+    let final_stock = *stock.lock().unwrap();
+    println!("最终剩余库存: {}", final_stock);
+    let successful_grabs = results.lock().unwrap().iter().filter(|r| matches!(r, SeckillResult::Success {..})).count();
+
+    // 断言检查
+    if config.initial_stock > 0 && final_stock == 0 { // 如果初始有库存且最终库存为0
+        assert_eq!(successful_grabs, config.initial_stock, "成功抢购数 ({}) 与初始库存消耗 ({}) 不匹配!", successful_grabs, config.initial_stock);
+    } else { // 其他情况 (如初始库存为0，或未抢光)
+        assert_eq!(config.initial_stock.saturating_sub(successful_grabs), final_stock, "库存计算不一致！");
+    }
+
+    if final_stock == 0 && config.initial_stock > 0 {
+        assert!(activity_officially_over.load(Ordering::Relaxed), "库存为0但活动结束标志未设置!");
+    }
+    println!("模拟结束。");
+}
+
+fn spawn_consumer_threads(
+    queue: Arc<Mutex<VecDeque<SeckillRequest>>>,
+    stock: Arc<Mutex<usize>>,
+    results: Arc<Mutex<Vec<SeckillResult>>>,
+    consumer_speeds: &[u64],
+    timeout_ms: u128,
+    producing_active: Arc<AtomicBool>,
+    activity_officially_over: Arc<AtomicBool>,
+) -> Vec<thread::JoinHandle<()>> {
+    let mut handles = vec![];
+    for (i, &speed) in consumer_speeds.iter().enumerate() {
+        let queue_clone = Arc::clone(&queue);
+        let stock_clone = Arc::clone(&stock);
+        let results_clone = Arc::clone(&results);
+        let producing_active_clone = Arc::clone(&producing_active);
+        let activity_over_clone = Arc::clone(&activity_officially_over);
+        let handle = thread::spawn(move || {
+            println!("消费者 #{} (速度上限 {}ms) 启动...", i + 1, speed);
+            memory_consumer(
+                queue_clone,
+                stock_clone,
+                results_clone,
+                speed,
+                timeout_ms,
+                producing_active_clone,
+                activity_over_clone,
+            );
+            println!("消费者 #{} (速度上限 {}ms) 退出.", i + 1, speed);
+        });
+        handles.push(handle);
+    }
+    handles
 }
 
 fn memory_consumer(
@@ -138,11 +289,6 @@ fn memory_consumer(
     }
 }
 
-fn push_to_memory_queue(queue: &Arc<Mutex<VecDeque<SeckillRequest>>>, user_id: usize, request_initiation_time: u128) {
-    let mut q = queue.lock().unwrap();
-    q.push_back(SeckillRequest { user_id, request_initiation_time });
-}
-
 fn enqueue_requests(
     user_count: usize,
     queue: &Arc<Mutex<VecDeque<SeckillRequest>>>,
@@ -209,39 +355,9 @@ fn enqueue_requests(
     println!("所有用户请求已发送至队列，生产者停止。");
 }
 
-
-fn spawn_consumer_threads(
-    queue: Arc<Mutex<VecDeque<SeckillRequest>>>,
-    stock: Arc<Mutex<usize>>,
-    results: Arc<Mutex<Vec<SeckillResult>>>,
-    consumer_speeds: &[u64],
-    timeout_ms: u128,
-    producing_active: Arc<AtomicBool>,
-    activity_officially_over: Arc<AtomicBool>,
-) -> Vec<thread::JoinHandle<()>> {
-    let mut handles = vec![];
-    for (i, &speed) in consumer_speeds.iter().enumerate() {
-        let queue_clone = Arc::clone(&queue);
-        let stock_clone = Arc::clone(&stock);
-        let results_clone = Arc::clone(&results);
-        let producing_active_clone = Arc::clone(&producing_active);
-        let activity_over_clone = Arc::clone(&activity_officially_over);
-        let handle = thread::spawn(move || {
-            println!("消费者 #{} (速度上限 {}ms) 启动...", i + 1, speed);
-            memory_consumer(
-                queue_clone,
-                stock_clone,
-                results_clone,
-                speed,
-                timeout_ms,
-                producing_active_clone,
-                activity_over_clone,
-            );
-            println!("消费者 #{} (速度上限 {}ms) 退出.", i + 1, speed);
-        });
-        handles.push(handle);
-    }
-    handles
+fn push_to_memory_queue(queue: &Arc<Mutex<VecDeque<SeckillRequest>>>, user_id: usize, request_initiation_time: u128) {
+    let mut q = queue.lock().unwrap();
+    q.push_back(SeckillRequest { user_id, request_initiation_time });
 }
 
 fn print_and_summarize_results(results_arc: &Arc<Mutex<Vec<SeckillResult>>>) {
@@ -288,70 +404,93 @@ fn print_and_summarize_results(results_arc: &Arc<Mutex<Vec<SeckillResult>>>) {
     }
 }
 
-fn simulate_backend_flow(config: &SeckillConfig) {
-    let stock = Arc::new(Mutex::new(config.initial_stock));
-    let queue = Arc::new(Mutex::new(VecDeque::new()));
-    let results = Arc::new(Mutex::new(Vec::new()));
-    let producing_active = Arc::new(AtomicBool::new(true)); // 生产者是否还在生成请求
-    let activity_officially_over = Arc::new(AtomicBool::new(false)); // 活动是否已正式结束 (库存为0)
+// =================== Kafka 模式相关异步函数 ===================
+async fn kafka_backend_flow(config: &SeckillConfig) {
+    let (brokers, topic) = match &config.queue_backend {
+        QueueBackend::Kafka { brokers, topic, .. } => (brokers.as_str(), topic.as_str()),
+        _ => unreachable!(),
+    };
+    println!("[Kafka] 开始创建Producer, brokers={}, topic={}", brokers, topic);
 
-    println!(
-        "模拟开始：{} 用户，{} 库存，{} 消费者 (各速度上限 {:?}ms)，超时 {}ms. 活动结束条件：库存为0.",
-        config.user_count, config.initial_stock, config.consumer_speeds.len(), config.consumer_speeds, config.timeout_ms
-    );
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("Producer creation error");
+    println!("[Kafka] Producer创建成功");
 
-    // 启动消费者线程
-    let consumer_handles = spawn_consumer_threads(
-        Arc::clone(&queue),
-        Arc::clone(&stock),
-        Arc::clone(&results),
-        &config.consumer_speeds,
-        config.timeout_ms,
-        Arc::clone(&producing_active),
-        Arc::clone(&activity_officially_over),
-    );
+    println!("[Kafka] 开始创建Consumer");
+    let group_id = "seckill_consumer_group";
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("group.id", group_id)
+        .set("bootstrap.servers", brokers)
+        .set("enable.partition.eof", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .expect("Consumer creation error");
+    consumer.subscribe(&[topic]).unwrap();
+    let consumer = Arc::new(consumer);
+    println!("[Kafka] Consumer创建并订阅成功，启动消费者任务");
 
-    // 启动生产者线程 (模拟用户请求入队)
-    let producer_handle = thread::spawn({
-        let queue_clone = Arc::clone(&queue);
-        let producing_active_clone = Arc::clone(&producing_active);
-        let user_count = config.user_count;
-        move || {
-            enqueue_requests(user_count, &queue_clone, producing_active_clone);
+    // 并发环境下的库存和结束标记
+    let stock = Arc::new(TokioMutex::new(config.initial_stock));
+    let activity_over = Arc::new(AtomicBool::new(false));
+
+    // 用mpsc传递结果
+    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+
+    // 启动消费者任务
+    let mut consumer_handles = vec![];
+    for i in 0..config.consumer_speeds.len() {
+        println!("[Kafka] 启动第{}个消费者任务", i + 1);
+        let consumer_clone = Arc::clone(&consumer);
+        let stock_clone = stock.clone();
+        let activity_over_clone = activity_over.clone();
+        let sender_clone = result_sender.clone();
+        let config_clone = config.clone();
+        consumer_handles.push(tokio::spawn(kafka_consumer(
+            consumer_clone,
+            config_clone,
+            sender_clone,
+            stock_clone,
+            activity_over_clone,
+        )));
+    }
+
+    println!("[Kafka] 所有消费者任务已启动, 开始批量生产消息...");
+    // 生产者批量发消息
+    for user_id in 1..=config.user_count {
+        let req = SeckillRequest {
+            user_id,
+            request_initiation_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+        };
+        if user_id % 300 == 0 {
+            println!("[Kafka] 已生产{}条请求", user_id);
         }
-    });
+        kafka_produce(&producer, topic, &req).await;
+    }
+    println!("[Kafka] 生产者所有消息已发送, 关闭result_sender");
 
-    // 等待生产者完成所有请求的入队
-    producer_handle.join().unwrap();
-    println!("所有生产者任务完成 (请求已入队)。等待消费者处理剩余队列...");
+    drop(result_sender); // 通知消费者：不会再有结果发进来了
 
-    // 等待所有消费者线程处理完毕并退出
+    println!("[Kafka] 开始接收消费者处理结果...");
+    // 收集结果
+    let mut all_results = Vec::new();
+    while let Some(r) = result_receiver.recv().await {
+        if all_results.len() % 100 == 0 {
+            println!("[Kafka] 已接收到{}条消费结果", all_results.len());
+        }
+        all_results.push(r);
+    }
+    println!("[Kafka] Kafka流程完成，总处理请求数：{}", all_results.len());
+
+    // 等待所有 Kafka consumer 任务退出，防止 runtime 挂起
+    // Stop the consumer
     for handle in consumer_handles {
-        handle.join().unwrap();
+        let _ = handle.await;
     }
-    println!("所有消费者已退出。");
-
-    // 打印并统计最终结果
-    print_and_summarize_results(&results);
-
-    // 获取最终剩余库存值，用于对照初始值和结果正确性校验
-    let final_stock = *stock.lock().unwrap();
-    println!("最终剩余库存: {}", final_stock);
-    let successful_grabs = results.lock().unwrap().iter().filter(|r| matches!(r, SeckillResult::Success {..})).count();
-
-    // 断言检查
-    if config.initial_stock > 0 && final_stock == 0 { // 如果初始有库存且最终库存为0
-        assert_eq!(successful_grabs, config.initial_stock, "成功抢购数 ({}) 与初始库存消耗 ({}) 不匹配!", successful_grabs, config.initial_stock);
-    } else { // 其他情况 (如初始库存为0，或未抢光)
-        assert_eq!(config.initial_stock.saturating_sub(successful_grabs), final_stock, "库存计算不一致！");
-    }
-
-    if final_stock == 0 && config.initial_stock > 0 {
-        assert!(activity_officially_over.load(Ordering::Relaxed), "库存为0但活动结束标志未设置!");
-    }
-    println!("模拟结束。");
+    println!("[Kafka] 所有Kafka消费者任务已退出");
 }
-
 
 async fn kafka_produce(
     producer: &FutureProducer,
@@ -447,141 +586,4 @@ async fn kafka_consumer(
         }
     }
     println!("[Kafka Consumer] 消费者退出，消息流关闭，已处理{}条消息", msg_count);
-}
-
-async fn kafka_backend_flow(config: &SeckillConfig) {
-    let (brokers, topic) = match &config.queue_backend {
-        QueueBackend::Kafka { brokers, topic, .. } => (brokers.as_str(), topic.as_str()),
-        _ => unreachable!(),
-    };
-    println!("[Kafka] 开始创建Producer, brokers={}, topic={}", brokers, topic);
-
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("message.timeout.ms", "5000")
-        .create()
-        .expect("Producer creation error");
-    println!("[Kafka] Producer创建成功");
-
-    println!("[Kafka] 开始创建Consumer");
-    let group_id = "seckill_consumer_group";
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("group.id", group_id)
-        .set("bootstrap.servers", brokers)
-        .set("enable.partition.eof", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .expect("Consumer creation error");
-    consumer.subscribe(&[topic]).unwrap();
-    let consumer = Arc::new(consumer);
-    println!("[Kafka] Consumer创建并订阅成功，启动消费者任务");
-
-    // 并发环境下的库存和结束标记
-    let stock = Arc::new(TokioMutex::new(config.initial_stock));
-    let activity_over = Arc::new(AtomicBool::new(false));
-
-    // 用mpsc传递结果
-    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
-
-    // 启动消费者任务
-    let mut consumer_handles = vec![];
-    for i in 0..config.consumer_speeds.len() {
-        println!("[Kafka] 启动第{}个消费者任务", i + 1);
-        let consumer_clone = Arc::clone(&consumer);
-        let stock_clone = stock.clone();
-        let activity_over_clone = activity_over.clone();
-        let sender_clone = result_sender.clone();
-        let config_clone = config.clone();
-        consumer_handles.push(tokio::spawn(kafka_consumer(
-            consumer_clone,
-            config_clone,
-            sender_clone,
-            stock_clone,
-            activity_over_clone,
-        )));
-    }
-
-    println!("[Kafka] 所有消费者任务已启动, 开始批量生产消息...");
-    // 生产者批量发消息
-    for user_id in 1..=config.user_count {
-        let req = SeckillRequest {
-            user_id,
-            request_initiation_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
-        };
-        if user_id % 300 == 0 {
-            println!("[Kafka] 已生产{}条请求", user_id);
-        }
-        kafka_produce(&producer, topic, &req).await;
-    }
-    println!("[Kafka] 生产者所有消息已发送, 关闭result_sender");
-
-    drop(result_sender); // 通知消费者：不会再有结果发进来了
-
-    println!("[Kafka] 开始接收消费者处理结果...");
-    // 收集结果
-    let mut all_results = Vec::new();
-    while let Some(r) = result_receiver.recv().await {
-        if all_results.len() % 100 == 0 {
-            println!("[Kafka] 已接收到{}条消费结果", all_results.len());
-        }
-        all_results.push(r);
-    }
-    println!("[Kafka] Kafka流程完成，总处理请求数：{}", all_results.len());
-
-    // 等待所有 Kafka consumer 任务退出，防止 runtime 挂起
-    // Stop the consumer
-    for handle in consumer_handles {
-        let _ = handle.await;
-    }
-    println!("[Kafka] 所有Kafka消费者任务已退出");
-}
-
-// run_seckill_simulation is now async
-async fn run_seckill_simulation(config: SeckillConfig) {
-    match config.queue_backend {
-        QueueBackend::Simulate => {
-            println!("[MAIN] 选择内存模拟后端，准备运行模拟流程...");
-            simulate_backend_flow(&config);
-        }
-        QueueBackend::Kafka { .. } => {
-            println!("[MAIN] 选择Kafka后端，准备连接Kafka并运行流程...");
-            kafka_backend_flow(&config).await;
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    // To test Simulate mode and remove the "variant Simulate is never constructed" warning:
-    let use_simulate_mode = true; // << CHANGE THIS TO true/false TO SWITCH MODES
-
-    let config = if use_simulate_mode {
-        println!("[MAIN] 配置为: 模拟模式");
-        SeckillConfig {
-            user_count: 2000, // Smaller count for faster simulation testing
-            initial_stock: 10,
-            consumer_speeds: vec![30, 50, 80], // Fewer consumers for simulation
-            timeout_ms: 110,
-            queue_backend: QueueBackend::Simulate, // This uses the Simulate variant
-        }
-    } else {
-        println!("[MAIN] 配置为: Kafka模式");
-        SeckillConfig {
-            user_count: 2000,
-            initial_stock: 20,
-            consumer_speeds: vec![30, 35, 40, 45, 50], // This implies 5 Kafka consumers
-            timeout_ms: 110, //ms
-            queue_backend: QueueBackend::Kafka {
-                brokers: "172.20.19.27:9092".to_string(),
-                topic: "seckill_test".to_string(),
-            },
-        }
-    };
-
-    println!("[MAIN] 启动秒杀系统，完整配置: {:?}", config);
-
-    // Call the unified simulation function
-    run_seckill_simulation(config.clone()).await; // Clone config if it's used later, or pass ownership
-
-    println!("[MAIN] 秒杀系统流程主入口退出。");
 }
