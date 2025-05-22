@@ -1,3 +1,7 @@
+mod common;
+mod server_kafka;
+mod client_kafka;
+
 use futures::StreamExt;
 use rand::{rng, seq::SliceRandom, Rng};
 use rdkafka::consumer::Consumer;
