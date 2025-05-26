@@ -1,0 +1,16 @@
+server:
+  brokers: "172.20.19.27:9092"
+  topic: "seckill_test"
+  stock: 10
+  timeout: 100
+  consumers: 2
+  status_interval: 10
+  reset_offset: false
+  group_id: "seckill_server_group"
+  redis_url: "redis://:passw0rd@172.20.19.27:6379/"
+client:
+  brokers: "172.20.19.27:9092"
+  topic: "seckill_test"
+  user_count: 1000
+  rate: 50
+  delay: 10
