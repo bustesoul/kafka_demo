@@ -13,3 +13,12 @@ pub enum SeckillResult {
     Fail { user_id: usize, cost_ms: u128, reason: String },
     PendingTimeout { user_id: usize, cost_ms: u128 },
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SeckillRecord {
+    pub user_id: u64,
+    pub activity_id: u64,
+    pub cost_ms: u128,
+    pub status: String,
+    pub timestamp: u64,
+}

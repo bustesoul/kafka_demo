@@ -60,3 +60,18 @@ pub async fn run_seckill_script(pool: &Arc<Pool>) -> Result<i64, redis::RedisErr
         .invoke_async(&mut conn)
         .await
 }
+
+pub async fn pop_log_detail(pool: &Arc<Pool>, timeout_secs: usize) -> Option<String> {
+    if let Ok(mut conn) = pool.get().await {
+        redis::cmd("BRPOP")
+            .arg("seckill:logs")
+            .arg(timeout_secs.to_string())
+            .query_async::<Option<(String, String)>>(&mut conn)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_key, val)| val)
+    } else {
+        None
+    }
+}

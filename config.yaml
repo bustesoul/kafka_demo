@@ -8,6 +8,7 @@ server:
   reset_offset: false
   group_id: "seckill_server_group"
   redis_url: "redis://:passw0rd@172.20.19.27:6379/"
+  pg_dsn: "postgres://buste:passw0rd@172.20.19.27:5432/kafka_example"
 client:
   brokers: "172.20.19.27:9092"
   topic: "seckill_test"

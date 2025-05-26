@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let redis_pool = Arc::new(redis_pool);
     init_state(&redis_pool, args.stock.unwrap_or(0)).await;
 
-    println!("Redis 初始化成功，库存: {:?}", args.stock);
+    println!("[Server] Redis 初始化成功，库存: {:?}", args.stock);
 
     let request_counter = Arc::new(AtomicUsize::new(0));
     // 新增三个原子计数器
@@ -198,8 +198,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             request_counter_clone_inner.fetch_add(1, Ordering::Relaxed);
                                             success_counter_inner.fetch_add(1, Ordering::Relaxed);
                                             if stock_result_val == 0 {
-                                                println!("*** Redis 库存刚刚被抢光，活动结束！");
+                                                println!("[Server] *** Redis 库存刚刚被抢光，活动结束！*** ");
                                             }
+                                            // ✨ 写入 Redis 日志列表
+                                            let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                            let log = SeckillRecord {
+                                                user_id: req.user_id as u64,
+                                                activity_id: 1,
+                                                cost_ms,
+                                                status: "success".into(),
+                                                timestamp: now_ts,
+                                            };
+                                            let payload = serde_json::to_string(&log).expect("Failed to serialize log");
+
+                                            let mut redis_conn = pool.get().await.expect("Redis conn");
+                                            let _: () = redis::cmd("LPUSH")
+                                                .arg("seckill:logs")
+                                                .arg(payload)
+                                                .query_async(&mut redis_conn)
+                                                .await
+                                                .expect("Failed to LPUSH log");
                                         }
                                     }
                                     Err(e) => {

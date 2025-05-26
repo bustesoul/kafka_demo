@@ -1,6 +1,7 @@
 mod common;
 mod server_kafka;
 mod client_kafka;
+mod log_worker;
 
 use futures::StreamExt;
 use rand::{rng, seq::SliceRandom, Rng};
