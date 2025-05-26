@@ -1,0 +1,81 @@
+version: '3'
+
+services:
+  zookeeper:
+    image: 'bitnami/zookeeper:3.7.0'
+    container_name: zookeeper
+    ports:
+      - '2181:2181'
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    volumes:
+      - 'zookeeper_data:/bitnami/zookeeper'
+    restart: unless-stopped
+    networks:
+      - kafka_default
+
+  kafka:
+    image: 'bitnami/kafka:2.8.0'
+    container_name: kafka
+    ports:
+      - '9092:9092'
+    environment:
+      - KAFKA_BROKER_ID=1
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_LISTENERS=INSIDE://kafka:29092,OUTSIDE://0.0.0.0:9092
+      - KAFKA_ADVERTISED_LISTENERS=INSIDE://kafka:29092,OUTSIDE://172.20.19.27:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+      - KAFKA_INTER_BROKER_LISTENER_NAME=INSIDE
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - 'kafka_data:/bitnami/kafka'
+    restart: unless-stopped
+    networks:
+      - kafka_default
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: buste
+      POSTGRES_PASSWORD: passw0rd
+      POSTGRES_DB: kafka_example
+    ports:
+      - '5432:5432'
+    volumes:
+      - 'pg_data:/var/lib/postgresql/data'
+    restart: unless-stopped
+    networks:
+      - kafka_default
+
+  redis:
+    image: 'bitnami/redis:6.2'
+    container_name: redis
+    ports:
+      - '6379:6379'
+      - '6380:6380'  # TLS-enabled port
+    environment:
+      - REDIS_PASSWORD=passw0rd  # Optional password
+      # - REDIS_TLS_ENABLED=yes  # Enable TLS
+      - REDIS_PORT=6379
+      # - REDIS_TLS_PORT=6380
+      # - REDIS_EXTRA_FLAGS=--tls-cert-file /certs/redis.crt --tls-key-file /certs/redis.key --tls-ca-cert-file /certs/ca.crt
+    volumes:
+      # - './certs:/certs'  # Path to store TLS certificates
+      - 'redis_data:/bitnami/redis'
+    restart: unless-stopped
+    networks:
+      - kafka_default
+
+volumes:
+  kafka_data:
+  pg_data:
+  zookeeper_data:
+  redis_data:
+
+networks:
+  kafka_default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
