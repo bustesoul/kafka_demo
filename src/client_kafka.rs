@@ -1,13 +1,14 @@
 // src/client_kafka.rs
 
+use std::collections::HashMap;
 use kafka_demo::common::*;
 use clap::Parser;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use futures::future::join_all;
-use rand::rng;
-use rand::seq::SliceRandom;
+use rand::{rng, seq::SliceRandom, Rng};
+use rand::seq::IndexedRandom;
 use kafka_demo::args::ClientArgs;
 
 #[allow(dead_code)]
@@ -37,6 +38,11 @@ async fn main() {
     let user_count = args.user_count.expect("Missing --user-count or config.client.user_count");
     let rate = args.rate.unwrap_or(100);
     let delay = args.delay.unwrap_or(0);
+    // 模拟数据
+    let mut rng = rng();
+    let item_ids = vec![1001, 1002, 1003, 1004, 1005];
+    let min_count = 1;
+    let max_count = 5;
 
     println!(
         "启动 client，配置：brokers={}, topic={}, user_count={}, rate={}, delay={}",
@@ -50,12 +56,18 @@ async fn main() {
         .expect("Producer creation error");
 
     let mut user_ids: Vec<usize> = (1..=user_count).collect();
-    user_ids.shuffle(&mut rng());
+    user_ids.shuffle(&mut rng);
 
     let mut futs = Vec::new();
     for user_id in user_ids {
+        // 随机 item id + 数量
+        let item_id = *item_ids.choose(&mut rng).unwrap();
+        let count = rng.random_range(min_count..=max_count);
+        let mut items = HashMap::new();
+        items.insert(item_id, count);
         let req = SeckillRequest {
             user_id,
+            items,
             request_initiation_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()

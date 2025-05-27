@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let timeout_counter = Arc::new(AtomicUsize::new(0));
     let fail_counter = Arc::new(AtomicUsize::new(0));
     let mut rng_producer = rng();
-    let delay_ms = rng_producer.random_range(5..=40);
+    let delay_ms = rng_producer.random_range(5..=15);
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("group.id", args_group_id)

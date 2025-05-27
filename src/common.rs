@@ -1,5 +1,6 @@
 // src/common.rs
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use crate::args::{ClientArgs, ServerArgs, ControlApiArgs, LogWorkerArgs};
 
 #[allow(dead_code)]
@@ -14,6 +15,7 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeckillRequest {
     pub user_id: usize,
+    pub items: HashMap<usize, usize>,
     pub request_initiation_time: u128, // timestamp in ms
 }
 
