@@ -8,56 +8,25 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use futures::future::join_all;
 use rand::rng;
 use rand::seq::SliceRandom;
-use serde::Deserialize;
-
-#[derive(Parser, Debug, Clone, Deserialize)]
-#[serde(default)]
-#[command(author, version, about)]
-struct Args {
-    #[arg(long)]
-    brokers: Option<String>,
-    #[arg(long)]
-    topic: Option<String>,
-    #[arg(long)]
-    user_count: Option<usize>,
-    #[arg(long)]
-    rate: Option<usize>, // 每秒最大并发数
-    #[arg(long)]
-    delay: Option<u64>, // 每条消息间隔ms
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            brokers: None,
-            topic: None,
-            user_count: None,
-            rate: None,
-            delay: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    client: Args,
-}
+use kafka_demo::args::ClientArgs;
 
 #[allow(dead_code)]
 #[tokio::main]
 async fn main() {
-    let mut args = Args::parse();
+    let mut args = ClientArgs::parse();
 
     // 合并 config.yaml
     let config_path = std::env::current_dir().unwrap().join("config.yaml");
     if config_path.exists() {
         if let Ok(file) = std::fs::File::open(config_path) {
             if let Ok(config) = serde_yaml::from_reader::<_, Config>(file) {
-                args.brokers = args.brokers.or(config.client.brokers);
-                args.topic = args.topic.or(config.client.topic);
-                args.user_count = args.user_count.or(config.client.user_count);
-                args.rate = args.rate.or(config.client.rate);
-                args.delay = args.delay.or(config.client.delay);
+                if let Some(client_cfg) = config.client {
+                    args.brokers = args.brokers.or(client_cfg.brokers);
+                    args.topic = args.topic.or(client_cfg.topic);
+                    args.user_count = args.user_count.or(client_cfg.user_count);
+                    args.rate = args.rate.or(client_cfg.rate);
+                    args.delay = args.delay.or(client_cfg.delay);
+                }
             }
         }
     }

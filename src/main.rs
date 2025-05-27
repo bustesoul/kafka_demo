@@ -1,4 +1,5 @@
 mod common;
+mod args;
 mod server_kafka;
 mod client_kafka;
 mod log_worker;

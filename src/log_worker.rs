@@ -1,47 +1,35 @@
-use chrono::DateTime;
 // src/log_worker.rs
+use chrono::DateTime;
 use clap::Parser;
 use deadpool_redis::{Config as RedisPoolConfig, Runtime};
-use kafka_demo::common::SeckillRecord;
+use kafka_demo::args::LogWorkerArgs;
+use kafka_demo::common::{Config, SeckillRecord};
 use kafka_demo::redis_state::pop_log_detail;
-use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::QueryBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
-
 /// 日志落库 Worker（消费 logs:detail）
-#[derive(Parser, Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-#[command(author, version, about)]
-struct Args {
-    #[arg(long)]
-    redis_url: Option<String>,
-
-    #[arg(long)]
-    pg_dsn: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    log_worker: Option<Args>,
-    server: Args,
-}
 
 #[allow(dead_code)]
 #[tokio::main]
 async fn main() {
-    let mut args = Args::parse();
+    let mut args = LogWorkerArgs::parse();
 
     // 合并 config.yaml
     let config_path = std::env::current_dir().unwrap().join("config.yaml");
     if config_path.exists() {
         if let Ok(file) = std::fs::File::open(config_path) {
             if let Ok(config) = serde_yaml::from_reader::<_, Config>(file) {
-                let fallback = config.log_worker.unwrap_or(config.server);
-                args.redis_url = args.redis_url.or(fallback.redis_url);
-                args.pg_dsn = args.pg_dsn.or(fallback.pg_dsn);
+                let log_worker = config.log_worker;
+                let server = config.server;
+                args.redis_url = args.redis_url
+                    .or_else(|| log_worker.as_ref().and_then(|x| x.redis_url.clone()))
+                    .or_else(|| server.as_ref().and_then(|s| s.redis_url.clone()));
+                args.pg_dsn = args.pg_dsn
+                    .or_else(|| log_worker.as_ref().and_then(|x| x.pg_dsn.clone()))
+                    .or_else(|| server.as_ref().and_then(|s| s.pg_dsn.clone()));
             }
         }
     }

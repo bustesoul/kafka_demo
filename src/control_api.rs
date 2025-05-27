@@ -13,38 +13,27 @@ use std::sync::Arc;
 use clap::Parser;
 use kafka_demo::redis_state::*;
 use sqlx::QueryBuilder;
-
-
-#[derive(Parser, Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-#[command(author, version, about)]
-struct Args {
-    #[arg(long)]
-    redis_url: Option<String>,
-
-    #[arg(long)]
-    pg_dsn: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    control_api: Option<Args>,
-    server: Args,
-}
+use kafka_demo::args::ControlApiArgs;
+use kafka_demo::common::Config;
 
 #[allow(dead_code)]
 #[tokio::main]
 async fn main() {
-    let mut args =  Args::parse();
+    let mut args =  ControlApiArgs::parse();
 
     // 合并 config.yaml
     let config_path = std::env::current_dir().unwrap().join("config.yaml");
     if config_path.exists() {
         if let Ok(file) = std::fs::File::open(config_path) {
             if let Ok(config) = serde_yaml::from_reader::<_, Config>(file) {
-                let fallback = config.control_api.unwrap_or(config.server);
-                args.redis_url = args.redis_url.or(fallback.redis_url);
-                args.pg_dsn = args.pg_dsn.or(fallback.pg_dsn);
+                let (ca, server) = (config.control_api, config.server);
+
+                args.redis_url = args.redis_url
+                    .or_else(|| ca.as_ref().and_then(|x| x.redis_url.clone()))
+                    .or_else(|| server.as_ref().and_then(|s| s.redis_url.clone()));
+                args.pg_dsn = args.pg_dsn
+                    .or_else(|| ca.as_ref().and_then(|x| x.pg_dsn.clone()))
+                    .or_else(|| server.as_ref().and_then(|s| s.pg_dsn.clone()));
             }
         }
     }

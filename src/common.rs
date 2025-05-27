@@ -1,5 +1,15 @@
 // src/common.rs
 use serde::{Deserialize, Serialize};
+use crate::args::{ClientArgs, ServerArgs, ControlApiArgs, LogWorkerArgs};
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub client: Option<ClientArgs>,
+    pub server: Option<ServerArgs>,
+    pub control_api: Option<ControlApiArgs>,
+    pub log_worker: Option<LogWorkerArgs>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SeckillRequest {

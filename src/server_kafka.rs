@@ -2,64 +2,18 @@
 use clap::Parser;
 use deadpool_redis::{Config as RedisPoolConfig, Runtime};
 use futures::StreamExt;
+use kafka_demo::args::ServerArgs;
 use kafka_demo::common::*;
+use kafka_demo::redis_state::*;
 use rand::{rng, Rng};
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::ClientConfig;
 use rdkafka::Message;
-use serde::Deserialize;
 use sqlx::types::chrono::{DateTime, Utc};
 use std::error::Error;
 use std::fs;
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
-use kafka_demo::redis_state::*;
-
-#[derive(Deserialize, Parser, Debug, Clone)]
-#[serde(default)]
-#[command(author, version, about)]
-struct Args {
-    #[arg(long)]
-    brokers: Option<String>,
-    #[arg(long)]
-    topic: Option<String>,
-    #[arg(long)]
-    stock: Option<usize>,
-    #[arg(long)]
-    timeout: Option<u128>,
-
-    #[arg(long)]
-    consumers: Option<usize>,
-    #[arg(long)]
-    status_interval: Option<u64>,
-    #[arg(long)]
-    reset_offset: Option<bool>,
-    #[arg(long)]
-    group_id: Option<String>,
-    #[arg(long)]
-    redis_url: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    server: Args,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            brokers: None,
-            topic: None,
-            stock: None,
-            timeout: None,
-            consumers: None,
-            status_interval: None,
-            reset_offset: None,
-            group_id: None,
-            redis_url: None,
-        }
-    }
-}
 
 #[allow(dead_code)]
 #[tokio::main]
@@ -67,20 +21,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 读取配置文件
     let config_content = fs::read_to_string("config.yaml").expect("Failed to read config.yaml");
     let config: Config = serde_yaml::from_str(&config_content).expect("Failed to parse config.yaml");
-
     // 解析命令行参数
-    let mut args = Args::parse();
-
+    let mut args = ServerArgs::parse();
     // 合并配置：命令行优先于配置文件
-    args.brokers = args.brokers.or(config.server.brokers);
-    args.topic = args.topic.or(config.server.topic);
-    args.stock = args.stock.or(config.server.stock);
-    args.timeout = args.timeout.or(config.server.timeout);
-    args.redis_url = args.redis_url.or(config.server.redis_url);
-    args.group_id = args.group_id.or(config.server.group_id);
-    args.status_interval = args.status_interval.or(config.server.status_interval);
-    args.consumers = args.consumers.or(config.server.consumers);
-    args.reset_offset = args.reset_offset.or(config.server.reset_offset);
+    if let Some(server_cfg) = &config.server {
+        args.brokers = args.brokers.or(server_cfg.brokers.clone());
+        args.topic = args.topic.or(server_cfg.topic.clone());
+        args.stock = args.stock.or(server_cfg.stock);
+        args.timeout = args.timeout.or(server_cfg.timeout);
+        args.consumers = args.consumers.or(server_cfg.consumers);
+        args.status_interval = args.status_interval.or(server_cfg.status_interval);
+        args.reset_offset = args.reset_offset.or(server_cfg.reset_offset);
+        args.group_id = args.group_id.or(server_cfg.group_id.clone());
+        args.redis_url = args.redis_url.or(server_cfg.redis_url.clone());
+    }
     // 其他字段使用命令行默认值或配置文件值
     println!("启动 server，配置：{args:?}");
 
