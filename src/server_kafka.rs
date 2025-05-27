@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .create_pool(Some(Runtime::Tokio1))
         .expect("Failed to create Redis connection pool");
     let redis_pool = Arc::new(redis_pool);
-    init_state(&redis_pool, args.stock.unwrap_or(0)).await;
+    init_state(&redis_pool, args.stock.unwrap_or(0) as i64).await;
 
     println!("[Server] Redis 初始化成功，库存: {:?}", args.stock);
 
