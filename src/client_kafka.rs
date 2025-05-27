@@ -43,6 +43,7 @@ struct Config {
     client: Args,
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() {
     let mut args = Args::parse();

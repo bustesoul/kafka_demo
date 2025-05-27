@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::{sleep, Instant};
 
 /// 日志落库 Worker（消费 logs:detail）
-#[derive(Parser, Debug, Clone, Deserialize)]
+#[derive(Parser, Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 #[command(author, version, about)]
 struct Args {
@@ -29,15 +29,7 @@ struct Config {
     server: Args,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            redis_url: None,
-            pg_dsn: None,
-        }
-    }
-}
-
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() {
     let mut args = Args::parse();

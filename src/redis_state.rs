@@ -75,3 +75,83 @@ pub async fn pop_log_detail(pool: &Arc<Pool>, timeout_secs: usize) -> Option<Str
         None
     }
 }
+
+pub async fn get_stats(pool: &Arc<Pool>, key: &str) -> Option<i64> {
+    if let Ok(mut conn) = pool.get().await {
+        conn.get(key).await.ok()
+    } else {
+        None
+    }
+}
+
+/// 查询当前 Redis 版本号
+pub async fn get_version(pool: &Arc<Pool>) -> Option<i64> {
+    if let Ok(mut conn) = pool.get().await {
+        conn.get("stock_version").await.ok()
+    } else {
+        None
+    }
+}
+
+/// 增加版本号（控制面所有修改都用它，返回新版本号）
+pub async fn incr_version(pool: &Arc<Pool>) -> Option<i64> {
+    if let Ok(mut conn) = pool.get().await {
+        conn.incr("stock_version", 1).await.ok()
+    } else {
+        None
+    }
+}
+
+/// 设置库存并同步重置状态、版本号，发布通知
+pub async fn set_stock(pool: &Arc<Pool>, value: i64) -> bool {
+    if let Ok(mut conn) = pool.get().await {
+        let mut pipe = redis::pipe();
+        pipe.cmd("SET").arg("stock").arg(value);
+        pipe.cmd("SET").arg("activity_over").arg("0");
+        pipe.cmd("INCR").arg("stock_version");
+        let result: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+        if result.is_ok() {
+            // PUBLISH 通知所有 server
+            let _: Result<i64, _> = conn.publish("control_channel", format!(r#"{{"cmd":"set_stock","value":{}}}"#, value)).await;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// 设置活动结束并发布通知
+pub async fn set_activity_finish(pool: &Arc<Pool>) -> bool {
+    if let Ok(mut conn) = pool.get().await {
+        let _: () = conn.set("activity_over", "1").await.unwrap_or(());
+        let _: () = conn.publish("control_channel", r#"{"cmd":"finish"}"#).await.unwrap_or(());
+        true
+    } else {
+        false
+    }
+}
+
+pub async fn sync_redis_from_db(pool: &Arc<Pool>, stock: i64) -> bool {
+    if let Ok(mut conn) = pool.get().await {
+    let mut pipe = redis::pipe();
+    pipe.cmd("SET").arg("stock").arg(stock);
+    pipe.cmd("SET").arg("activity_over").arg("0");
+    pipe.cmd("INCR").arg("stock_version");
+    let result: redis::RedisResult<()> = pipe.query_async(&mut conn).await;
+    if result.is_ok() {
+            let _: Result<i64, _> = conn
+                .publish(
+                    "control_channel",
+                    format!(r#"{{"cmd":"sync_from_db","value":{}}}"#, stock),
+                )
+                .await;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}

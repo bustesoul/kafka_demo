@@ -4,12 +4,13 @@ BIN_DIR="target/debug"
 
 usage() {
   cat <<EOF
-Usage: $0 [server|client|log_worker] [options]
+Usage: $0 [server|client|log_worker|control_api] [options]
 
 Modes:
   server                  启动服务器端 Kafka 模拟器
   client                  启动客户端请求模拟器（默认）
   log_worker              启动日志处理 Worker
+  control_api             启动控制中心 API
 
 Options:
   --brokers <BROKERS>     Kafka broker 地址
@@ -31,7 +32,7 @@ if [[ "$1" == "help" || "$1" == "--help" || "$1" == "-h" ]]; then
 fi
 
 echo "Building project..."
-cargo build --bin server_kafka --bin client_kafka --bin log_worker || exit 1
+cargo build --bin server_kafka --bin client_kafka --bin log_worker --bin control_api || exit 1
 
 MODE="${1:-client}"
 shift
@@ -44,6 +45,9 @@ case "$MODE" in
     ;;
   log_worker)
     BIN_PATH="$BIN_DIR/log_worker"
+    ;;
+  control_api)
+    BIN_PATH="$BIN_DIR/control_api"
     ;;
   *)
     usage

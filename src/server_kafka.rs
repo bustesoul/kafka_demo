@@ -61,6 +61,7 @@ impl Default for Args {
     }
 }
 
+#[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // 读取配置文件
