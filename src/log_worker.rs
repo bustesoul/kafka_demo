@@ -114,13 +114,15 @@ async fn insert_batch(pool: &sqlx::PgPool, records: &[SeckillRecord]) -> Result<
     let mut tx = pool.begin().await?;
 
     let mut builder = QueryBuilder::new(
-        "INSERT INTO seckill_record (user_id, activity_id, cost_ms, status, ts) ",
+        "INSERT INTO seckill_record (user_id, activity_id, item_id, quantity, cost_ms, status, ts) ",
     );
 
     builder.push_values(records, |mut b, r| {
         b.push_bind(r.user_id as i64)
             .push_bind(r.activity_id as i64)
-            .push_bind(r.cost_ms as i32)
+            .push_bind(r.item_id as i64)
+            .push_bind(r.quantity as i64)
+            .push_bind(r.cost_ms as i64)
             .push_bind(&r.status)
             .push_bind(DateTime::from_timestamp(
                 r.timestamp as i64,

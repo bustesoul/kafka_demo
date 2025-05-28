@@ -1,7 +1,7 @@
 // src/common.rs
+use crate::args::{ClientArgs, ControlApiArgs, LogWorkerArgs, ServerArgs};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::args::{ClientArgs, ServerArgs, ControlApiArgs, LogWorkerArgs};
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -21,15 +21,27 @@ pub struct SeckillRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SeckillResult {
-    Success { user_id: usize, cost_ms: u128 },
-    Fail { user_id: usize, cost_ms: u128, reason: String },
-    PendingTimeout { user_id: usize, cost_ms: u128 },
+    Success {
+        user_id: usize,
+        cost_ms: u128,
+    },
+    Fail {
+        user_id: usize,
+        cost_ms: u128,
+        reason: String,
+    },
+    PendingTimeout {
+        user_id: usize,
+        cost_ms: u128,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SeckillRecord {
     pub user_id: u64,
     pub activity_id: u64,
+    pub item_id: u64,  // New field
+    pub quantity: u64, // New field
     pub cost_ms: u128,
     pub status: String,
     pub timestamp: u64,

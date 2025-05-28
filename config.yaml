@@ -1,7 +1,11 @@
 server:
   brokers: "172.20.19.27:9092"
   topic: "seckill_test"
-  stock: 10
+  stock:
+    1001: 10
+    1002: 5
+    1003: 5
+    1004: 5
   timeout: 100
   consumers: 2
   status_interval: 10

@@ -15,6 +15,7 @@ use kafka_demo::redis_state::*;
 use sqlx::QueryBuilder;
 use kafka_demo::args::ControlApiArgs;
 use kafka_demo::common::Config;
+use std::collections::HashMap;
 
 #[allow(dead_code)]
 #[tokio::main]
@@ -82,11 +83,11 @@ pub struct ApiState {
 
 #[derive(Deserialize)]
 pub struct SetStockInput {
-    pub value: i64,
+    pub value: HashMap<usize, i64>, // 支持多商品
 }
 #[derive(Serialize)]
 pub struct StatusDetail {
-    pub stock: Option<i64>,
+    pub stock: HashMap<usize, Option<i64>>, // 多商品
     pub over: bool,
     pub version: Option<i64>,
     pub success: Option<i64>,
@@ -114,15 +115,22 @@ pub async fn finish_activity_api(State(state): State<ApiState>) -> Json<bool> {
 }
 
 // 3. 查询全部状态
+// 假设支持一组商品
+const ITEM_IDS: &[usize] = &[1001, 1002, 1003];
+
 pub async fn status_api(State(state): State<ApiState>) -> Json<StatusDetail> {
-    let stock = get_stock(&state.redis).await;
+    let mut stock_map = HashMap::new();
+    for &item_id in ITEM_IDS {
+        let stock = get_stock(&state.redis, item_id).await;
+        stock_map.insert(item_id, stock);
+    }
     let over = is_activity_over(&state.redis).await;
     let version = get_version(&state.redis).await;
     let success = get_stats(&state.redis, "stats:success").await;
     let fail = get_stats(&state.redis, "stats:fail").await;
     let timeout = get_stats(&state.redis, "stats:timeout").await;
     Json(StatusDetail {
-        stock,
+        stock: stock_map,
         over,
         version,
         success,
@@ -137,7 +145,10 @@ pub async fn sync_from_db_api(
     Query(q): Query<SyncFromDbInput>,
 ) -> Json<bool> {
     if let Some(stock) = get_activity_stock(&state.pg, q.activity_id).await {
-        let ok = sync_redis_from_db(&state.redis, stock).await;
+        // 单商品，需包装成 HashMap
+        let mut stocks = HashMap::new();
+        stocks.insert(q.activity_id as usize, stock);
+        let ok = sync_redis_from_db(&state.redis, stocks).await;
         Json(ok)
     } else {
         Json(false)
