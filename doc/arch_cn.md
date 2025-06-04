@@ -2,7 +2,7 @@
 
 ## 1. 项目概述
 
-本项目模拟了一个高并发的秒杀系统，旨在处理大量并发用户请求。它利用 Apache Kafka 进行异步消息队列，并使用 Redis 进行实时、原子性的库存管理和临时日志记录。主要目标是展示一个健壮且可扩展的架构，用于在极端负载下管理有限的库存。
+本项目模拟了一个高并发的秒杀系统，旨在处理大量并发用户请求。系统基于 Apache Kafka 的消息队列和 Redis 的原子操作，支持多商品秒杀、实时库存同步以及日志持久化。通过 HTTP 控制接口可以在运行时调整库存或结束活动。
 
 ## 2. 核心组件
 
@@ -45,38 +45,45 @@
 *   **关键数据结构**: `SeckillRequest`, `SeckillRecord`。
 *   **依赖**: `rdkafka`, `deadpool-redis`, `redis`, `tokio`, `clap`, `serde_yaml`。
 
-### 2.3. `log_worker` (Kafka 消费者 & 数据库持久化器 - *推断*)
+### 2.3. `log_worker` (日志消费与数据库持久化器)
 
-*   **角色**: (从 `Cargo.toml` 和 `server_kafka` 中 `seckill:logs` 的使用推断) 该组件可能负责异步消费 `seckill:logs` Redis 列表中的成功秒杀记录，并将其持久化到 PostgreSQL 数据库。
-*   **功能 (推断)**:
+*   **角色**: 异步消费 `seckill:logs` Redis 列表中的成功秒杀记录，并批量写入 PostgreSQL 数据库。
+*   **功能**:
     *   连接到 Redis 和 PostgreSQL。
-    *   使用 `BRPOP` 命令阻塞并等待 `seckill:logs` 列表中的新成功记录。
-    *   反序列化 `SeckillRecord` 并将其插入到 PostgreSQL 表中。
-*   **依赖 (推断)**: `redis`, `sqlx`, `tokio`。
+    *   使用 `BRPOP` 阻塞弹出日志条目，批量缓存并定时写入数据库。
+    *   定期打印状态报告，便于监控 Worker 运行状况。
+*   **依赖**: `redis`, `sqlx`, `tokio`。
 
-### 2.4. `src/main.rs` (替代/遗留模拟 - *只读*)
+### 2.4. `control_api` (库存与活动控制接口)
 
-*   **角色**: 此文件似乎是秒杀模拟的替代或遗留入口点。
-*   **功能**: 它支持内存队列模拟 (`QueueBackend::Simulate`) 和基于 Kafka 的模拟 (`QueueBackend::Kafka`)。虽然它也与 Kafka 交互，但 `server_kafka.rs` 和 `client_kafka.rs` 二进制文件提供了更专用和简化的 Kafka 中心实现。此组件可能用于在没有外部 Kafka/Redis 依赖的情况下进行本地测试，或用于比较不同的队列策略。
+*   **角色**: 提供基于 HTTP 的管理接口，用于在运行时调整库存、结束活动以及同步数据库库存到 Redis。
+*   **功能**:
+    *   `/set_stock` 重置指定商品库存并广播通知。
+    *   `/finish_activity` 标记活动结束。
+    *   `/status` 查询当前库存、统计数据与版本号。
+    *   `/sync_from_db` 从数据库同步库存到 Redis。
+*   **依赖**: `axum`, `redis`, `sqlx`。
+
 
 ## 3. 共享模块
 
 ### 3.1. `src/common.rs`
 
 *   定义了跨不同组件使用的通用数据结构：
-    *   `SeckillRequest`: 表示用户请求，包括 `user_id` 和 `request_initiation_time`。
-    *   `SeckillResult`: (主要用于 `src/main.rs` 中的模拟结果，不直接用于 Kafka 客户端/服务器)。
-    *   `SeckillRecord`: 表示成功的秒杀事件，包含 `user_id`、`activity_id`、`cost_ms`、`status` 和 `timestamp`。这是推送到 Redis 进行日志记录的数据。
+    *   `SeckillRequest`: 表示用户请求，包含 `user_id`、`items`（商品与数量的映射）和 `request_initiation_time`。
+    *   `SeckillResult`: 主要用于旧版模拟，不再在核心流程中使用。
+    *   `SeckillRecord`: 记录成功的秒杀事件，字段包括 `user_id`、`activity_id`、`item_id`、`quantity`、`cost_ms`、`status` 和 `timestamp`，会被推送到 Redis 日志队列。
 
 ### 3.2. `src/redis_state.rs`
 
 *   封装了所有与 Redis 相关的操作，提供了与 Redis 存储交互的清晰 API：
-    *   `get_stock`: 从 Redis 获取当前库存数量。
+    *   `get_stock`: 查询指定 `item_id` 的库存。
     *   `is_activity_over`: 检查秒杀活动是否已被标记为结束。
-    *   `set_activity_over`: 将秒杀活动标记为结束。
-    *   `init_state`: 初始化 Redis 中的库存和活动状态键。
-    *   `run_seckill_script`: 执行核心 Redis Lua 脚本，用于原子性地减少库存和增加成功计数。这对于防止竞态条件至关重要。
-    *   `pop_log_detail`: 从 `seckill:logs` 列表中弹出秒杀日志条目（供 `log_worker` 使用）。
+    *   `set_activity_finish`: 将秒杀活动标记为结束并广播通知。
+    *   `init_state`、`set_stock`、`sync_redis_from_db`: 用于初始化和重置多商品库存。
+    *   `run_seckill_script`: 执行核心 Lua 脚本，原子性地校验并扣减多个商品的库存。
+    *   `pop_log_detail`: 从 `seckill:logs` 列表弹出日志条目供 `log_worker` 消费。
+    *   `get_stats`、`get_version`、`incr_version`: 查询或递增统计和版本号。
 
 ## 4. 数据流和交互
 
@@ -85,7 +92,7 @@
 3.  **请求处理**: 多个 `server_kafka` 实例/线程从 Kafka 主题消费消息。每个消费者并发处理请求。
 4.  **原子库存管理**: 对于每个请求，`server_kafka` 执行一个 Redis Lua 脚本 (`run_seckill_script`)。该脚本确保库存检查、减少和活动状态更新作为单个不可分割的事务原子性地执行，从而防止超卖并确保高并发环境中的数据一致性。
 5.  **成功日志记录**: 如果秒杀请求成功（库存可用并已减少），`server_kafka` 会创建一个 `SeckillRecord` 并将其推送到 Redis 列表 (`seckill:logs`)。这作为成功交易的临时缓冲区。
-6.  **持久化日志记录 (推断)**: `log_worker`（如果已实现）将从 `seckill:logs` Redis 列表中消费这些 `SeckillRecord` 条目，并将其持久化到 PostgreSQL 数据库，用于长期存储、分析和审计。
+6.  **持久化日志记录**: `log_worker` 从 `seckill:logs` Redis 列表消费 `SeckillRecord`，批量写入 PostgreSQL 数据库，用于长期存储、分析和审计。
 7.  **实时监控**: `server_kafka` 提供定期的控制台输出，总结秒杀的当前状态（剩余库存、成功/失败/超时计数），提供即时操作洞察。
 
 ```mermaid
@@ -113,7 +120,7 @@ graph TD
         F -- 推送 SeckillRecord --> H
     end
 
-    subgraph 日志/分析 (推断)
+    subgraph 日志/分析
         H -- 弹出 SeckillRecord --> I[log_worker]
         I --> J(PostgreSQL 数据库)
     end
